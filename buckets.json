@@ -1,0 +1,7 @@
+{
+  "buckets": [
+    {"key": "api-requests", "limit": 100, "window_seconds": 60},
+    {"key": "llm-tokens", "limit": 10000, "window_seconds": 60},
+    {"key": "heavy-jobs", "limit": 5, "window_seconds": 300}
+  ]
+}

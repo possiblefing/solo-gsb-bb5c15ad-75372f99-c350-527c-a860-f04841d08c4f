@@ -1,0 +1,15 @@
+services:
+  quota-api:
+    build: .
+    image: rolling-quota-api
+    ports:
+      - "8000:8000"
+    environment:
+      QUOTA_DB_PATH: /data/quota.db
+      QUOTA_BUCKETS_CONFIG: /app/buckets.json
+    volumes:
+      - quota-data:/data
+    restart: unless-stopped
+
+volumes:
+  quota-data:
