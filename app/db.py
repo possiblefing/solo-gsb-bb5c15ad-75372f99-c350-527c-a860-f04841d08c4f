@@ -23,19 +23,27 @@ CREATE TABLE IF NOT EXISTS buckets (
     parent_key      TEXT REFERENCES buckets (key)
 );
 
--- 滚动窗口用量事件：每次放行按"贡献链"写入，窗口内求和即为当前用量。
+-- 滚动窗口用量事件：每次放行（含预留占用与确认转正）按"贡献链"写入，
+-- 窗口内求和即为当前用量。
 -- direct=1：请求直接点名本桶的贡献；direct=0：后代桶消费沿父链向上
 -- 汇总到本桶的贡献（同一请求对同一祖先至多一条汇总，不重复生成）。
+-- reservation_id 非空表示该事件由某条**生效中**（status='reserved'）的
+-- 预留占用；确认时在原事务内置空转为正式消费，取消/惰性过期时随整条
+-- 贡献链删除。正式消费（含确认转正后的事件）该列为 NULL。
 CREATE TABLE IF NOT EXISTS usage_events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    bucket_key  TEXT    NOT NULL REFERENCES buckets (key),
-    request_id  TEXT    NOT NULL,
-    amount      INTEGER NOT NULL CHECK (amount > 0),
-    created_at  REAL    NOT NULL,
-    direct      INTEGER NOT NULL DEFAULT 1 CHECK (direct IN (0, 1))
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    bucket_key      TEXT    NOT NULL REFERENCES buckets (key),
+    request_id      TEXT    NOT NULL,
+    amount          INTEGER NOT NULL CHECK (amount > 0),
+    created_at      REAL    NOT NULL,
+    direct          INTEGER NOT NULL DEFAULT 1 CHECK (direct IN (0, 1)),
+    reservation_id  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_bucket_ts
     ON usage_events (bucket_key, created_at);
+-- idx_usage_events_reservation（reservation_id 列）在迁移后创建，
+-- 以便从更早版本（无该列）增量升级的旧库也能建索引：见 init_db 末尾
+-- _POST_MIGRATION_INDEXES。
 
 -- 幂等表：request_id 首次出现时固化载荷哈希与判定结果
 -- release_id 非空表示该消费已被对应释放单成功释放
@@ -69,6 +77,47 @@ CREATE TABLE IF NOT EXISTS adjustments (
     created_at    REAL    NOT NULL
 );
 
+-- 预留生命周期表：创建预留即在单个写事务内按当前配额树展开整条贡献链
+-- 并立即以 usage_events.reservation_id = reservation_id 占用容量。
+-- status：reserved（生效中）/ confirmed（已确认，占用转为正式消费）/
+--         cancelled（已取消，整条贡献链已删除）/
+--         expired（已过期惰性释放，整条贡献链已删除）。
+-- 后三者为互斥终态：由 BEGIN IMMEDIATE 串行化 + 条件 UPDATE
+-- （WHERE status='reserved' AND expires_at > now）保证确认、取消与
+-- 惰性过期清理并发时只有一个终态。
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_id TEXT PRIMARY KEY,
+    payload_hash   TEXT    NOT NULL,
+    payload        TEXT    NOT NULL,
+    status         TEXT    NOT NULL
+                   CHECK (status IN ('reserved', 'confirmed',
+                                     'cancelled', 'expired')),
+    expires_at     REAL    NOT NULL,
+    created_at     REAL    NOT NULL,
+    confirmed_at   REAL,
+    ended_at       REAL
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_expiry
+    ON reservations (status, expires_at);
+
+-- 确认幂等表：confirm_id 首次成功确认时固化目标预留与确认结果。
+-- 同 confirm_id 同目标重放原样返回，改指其他预留返回 409。
+CREATE TABLE IF NOT EXISTS reservation_confirmations (
+    confirm_id     TEXT PRIMARY KEY,
+    reservation_id TEXT    NOT NULL,
+    result         TEXT    NOT NULL,
+    created_at     REAL    NOT NULL
+);
+
+-- 取消幂等表：cancel_id 首次成功取消时固化目标预留与取消结果。
+-- 同 cancel_id 同目标重放原样返回，改指其他预留返回 409。
+CREATE TABLE IF NOT EXISTS reservation_cancellations (
+    cancel_id      TEXT PRIMARY KEY,
+    reservation_id TEXT    NOT NULL,
+    result         TEXT    NOT NULL,
+    created_at     REAL    NOT NULL
+);
+
 -- 哈希审计链：仅追加。seq 全局递增，首条 prev_hash 为 64 个 0，
 -- hash = SHA-256(prev_hash 的原始32字节 + canonical JSON 事件)
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -100,6 +149,19 @@ _MIGRATIONS = (
         "direct",
         "ALTER TABLE usage_events ADD COLUMN direct INTEGER NOT NULL DEFAULT 1",
     ),
+    (
+        "usage_events",
+        "reservation_id",
+        "ALTER TABLE usage_events ADD COLUMN reservation_id TEXT",
+    ),
+)
+
+
+# 依赖迁移后新列的索引（CREATE INDEX IF NOT EXISTS 在旧库升级时也安全）：
+# 取消/过期按预留删除整条贡献链；确认按预留把事件置为正式消费
+_POST_MIGRATION_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_usage_events_reservation "
+    "ON usage_events (reservation_id)",
 )
 
 
@@ -120,6 +182,8 @@ def init_db(db_path: str | None = None) -> None:
     try:
         conn.executescript(SCHEMA)
         _apply_migrations(conn)
+        for ddl in _POST_MIGRATION_INDEXES:
+            conn.execute(ddl)
     finally:
         conn.close()
 

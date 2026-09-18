@@ -25,6 +25,26 @@ class AdjustmentRequest(BaseModel):
     buckets: list[BucketItem] = Field(min_length=1, max_length=100)
 
 
+class ReservationRequest(BaseModel):
+    """创建预留：提交桶列表与 TTL（expires_in 秒），单事务展开贡献链占用。"""
+
+    reservation_id: str = Field(min_length=1, max_length=128)
+    buckets: list[BucketItem] = Field(min_length=1, max_length=100)
+    expires_in: float = Field(gt=0, le=365 * 24 * 3600)
+
+
+class ReservationConfirmRequest(BaseModel):
+    """确认预留：confirm_id 为本次确认的客户端幂等键。"""
+
+    confirm_id: str = Field(min_length=1, max_length=128)
+
+
+class ReservationCancelRequest(BaseModel):
+    """取消预留：cancel_id 为本次取消的客户端幂等键。"""
+
+    cancel_id: str = Field(min_length=1, max_length=128)
+
+
 class BucketConfig(BaseModel):
     limit: int = Field(gt=0, le=2**31 - 1)
     window_seconds: float = Field(gt=0, le=365 * 24 * 3600)

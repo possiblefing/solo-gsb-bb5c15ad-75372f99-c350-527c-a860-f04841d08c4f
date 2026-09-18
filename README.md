@@ -22,11 +22,19 @@
   **原贡献链不变**，全部通过才按同一展开规则原子替换整条贡献链；
   `adjustment_id` 幂等，同载荷重放原样返回、改换载荷返回 **409**；调整之后
   释放撤销的是**调整后**的贡献链
+- **预留生命周期**：`POST /v1/quota/reservations` 提交桶列表与 `expires_in`，
+  在单个写事务内按当前配额树展开**整条贡献链并立即占用容量**，任一层不足则
+  整体失败（**429**，零占用）；`.../{id}/confirm` 把生效预留转为正式消费且
+  **不二次扣量**，`.../{id}/cancel` 释放整条贡献链；过期预留在后续相关操作中
+  **惰性释放**；确认、取消与过期清理并发时**只能有一个终态**，重复请求幂等
+  返回，改换载荷返回 **409**；审计链记录首次创建成功及最终状态变更
 - **并发安全**：SQLite `BEGIN IMMEDIATE` 串行化写事务，并发请求不会突破限额
 - **用量查询**：随时查询桶当前窗口用量，`direct_used`（仅直接点名本桶）与
-  `total_used`（含后代沿父链的汇总；`used` 为其历史别名）
-- **哈希审计链**：首次判定（放行/拒绝）与首次成功释放均在各自原事务内追加
-  一条 SHA-256 哈希链记录，幂等重放不重复记录；提供按 `seq` 翻页查询与全链重算校验
+  `total_used`（含后代沿父链的汇总；`used` 为其历史别名），另以
+  `reserved_used` 单列其中生效预留的占用
+- **哈希审计链**：首次判定（放行/拒绝）、首次成功释放、首次成功调整与预留的
+  **首次创建成功及最终状态变更**（确认/取消/过期）均在各自原事务内追加一条
+  SHA-256 哈希链记录，幂等重放不重复记录；提供按 `seq` 翻页查询与全链重算校验
 - **历史回放模拟**：`POST /v1/quota/simulations` 在隔离内存中回放历史消费，
   评估候选桶配置（limit/window）会带来的判定翻转（祖先限额同样参与判定），
   全程只读、不写数据库也不追加审计链
@@ -253,7 +261,111 @@ curl -X POST http://localhost:8000/v1/quota/adjustments \
 返回的 `released_buckets` 也是调整后的桶列表；调整后重放原 `consume` 仍只返回
 首次判定、不重新扣减原桶。
 
-### 5. 查询桶当前窗口用量
+### 5. 预留生命周期（先占容量，后确认/取消）
+
+预留用于"先占住整条配额链容量，稍后再决定是否真正消费"：创建时在**单个
+写事务**内按当前配额树展开整条贡献链并**立即占用**直接桶与全部祖先的容量，
+任一层不足则整体失败、零占用。预留有 TTL（`expires_in` 秒），可被确认转正、
+显式取消，或在过期后由后续相关操作惰性释放。
+
+#### 5.1 创建预留（原子占用整条贡献链）
+
+```bash
+curl -X POST http://localhost:8000/v1/quota/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"reservation_id": "resv-001",
+       "buckets": [{"key": "api-requests", "amount": 10},
+                   {"key": "llm-tokens",  "amount": 2000}],
+       "expires_in": 120}'
+```
+
+成功（`201`，容量已立即占用，占用持续到确认/取消/过期）：
+
+```json
+{"reservation_id": "resv-001", "reserved": true,
+ "buckets": [{"key": "api-requests", "amount": 10},
+             {"key": "llm-tokens", "amount": 2000}],
+ "events_reserved": 2,
+ "expires_at": 1789657800.12, "reserved_at": 1789657680.12}
+```
+
+> `events_reserved` 为整条贡献链的事件数：多级配额树中叶桶预留会同时占用
+> 每个祖先各一条汇总事件（例如三级树中叶桶为 3）。配额树中任一层容量不足时
+> 与 `consume` 同形返回 `429`（含 `limited_buckets`、`Retry-After`），
+> **所有层均零占用**；`429` 不固化，额度释放后同一 `reservation_id` 可重试。
+> 桶未配置返回 `404`；`expires_in` 为正数（上限 365 天）。
+
+创建语义：
+
+| 场景 | 结果 |
+| --- | --- |
+| 相同 `reservation_id` + 相同载荷（含相同 `expires_in`）重放 | `201`，原样返回首次创建结果，响应头 `X-Idempotent-Replay: true`，不重复占用（即使预留此后已确认/取消/过期，仍返回首次创建结果） |
+| 相同 `reservation_id` 改换桶/金额/`expires_in` | `409` |
+| `reservation_id` 与已存在的消费 `request_id` 撞键（或反向撞键） | `409` |
+| 贡献链上任一桶容量不足 | `429`，整体零占用，不固化、可同 ID 重试 |
+| 存在未配置桶（含祖先引用中断） | `404` |
+
+#### 5.2 确认预留（转正式消费，不二次扣量）
+
+```bash
+curl -X POST http://localhost:8000/v1/quota/reservations/resv-001/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"confirm_id": "confirm-001"}'
+```
+
+成功（`200`）：把预留占用事件**原地转正**为正式消费（金额与时间戳不变，
+故不二次扣量），此后该预留与普通放行消费无异——可被 `releases`/`adjustments`
+处理，以同 ID 重放 `consume` 命中固化判定、不重复扣减：
+
+```json
+{"reservation_id": "resv-001", "confirmed": true,
+ "buckets": [{"key": "api-requests", "amount": 10},
+             {"key": "llm-tokens", "amount": 2000}],
+ "events_committed": 2,
+ "confirmed_at": 1789657690.12}
+```
+
+#### 5.3 取消预留（释放整条贡献链）
+
+```bash
+curl -X POST http://localhost:8000/v1/quota/reservations/resv-001/cancel \
+  -H 'Content-Type: application/json' \
+  -d '{"cancel_id": "cancel-001"}'
+```
+
+成功（`200`）：在单事务内把预留置为 `cancelled` 并删除整条占用贡献链
+（直接桶 + 全部祖先），各层用量即刻恢复：
+
+```json
+{"reservation_id": "resv-001", "cancelled": true,
+ "released_buckets": [{"key": "api-requests", "amount": 10},
+                      {"key": "llm-tokens", "amount": 2000}],
+ "events_reverted": 2,
+ "cancelled_at": 1789657690.12}
+```
+
+确认与取消语义：
+
+| 场景 | 结果 |
+| --- | --- |
+| 相同 `confirm_id`/`cancel_id` + 相同预留重放 | `200`，原样返回首次结果，响应头 `X-Idempotent-Replay: true`，不重复执行 |
+| 相同 `confirm_id`/`cancel_id` 改指其他预留 | `409` |
+| 预留不存在 | `404` |
+| 确认已取消/已确认/已过期的预留，或取消已确认/已取消/已过期的预留 | `409`（确认、取消与过期清理只能有一个终态） |
+| 确认/取消并发竞争落败（含恰在过期时刻） | `409`；终态唯一，胜出方为 `confirmed`/`cancelled`/`expired` 之一 |
+
+#### 5.4 过期与惰性释放
+
+预留到达 `expires_at` 后**不会**立即删除，而是在后续**相关操作**
+（`consume`、`releases`、`adjustments`、创建/确认/取消预留）进入写事务前被
+**惰性释放**：在独立短事务内条件抢占 `expired` 终态、删除整条占用贡献链并
+追加一条 `reserve/expired` 审计。对已过期预留调用确认/取消一律返回 `409`
+（终态只能是 `expired`）。终态转移由 `BEGIN IMMEDIATE` 串行化与条件
+`UPDATE ... WHERE status='reserved' AND expires_at > now` 共同保证：
+确认、取消与过期清理并发时只有一个终态，容量要么仍被正式消费占用、要么已完整
+释放，不会出现二次扣量或容量泄漏。
+
+### 6. 查询桶当前窗口用量
 
 ```bash
 curl http://localhost:8000/v1/buckets/llm-tokens/usage
@@ -263,6 +375,7 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 {"key": "llm-tokens", "limit": 10000, "window_seconds": 60,
  "parent_key": null,
  "used": 500, "direct_used": 500, "total_used": 500,
+ "reserved_used": 0,
  "remaining": 9500,
  "window_start": 1789657597.55, "as_of": 1789657657.55,
  "oldest_event_expires_at": 1789657717.47}
@@ -274,15 +387,18 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 - `total_used`：本桶全部用量 = 直接贡献 + 后代桶沿父链上卷的汇总贡献；
   内部（祖先）桶上 `direct_used` 可能为 0 而 `total_used` 非 0；
 - `used`：`total_used` 的历史别名（保持兼容）；
+- `reserved_used`：`total_used` 中由**生效预留**占用的部分（含本桶直接预留
+  与后代预留上卷）；确认转正后归零（计入正式消费）、取消/过期后随链释放；
 - `remaining`：按 `total_used` 相对 `limit` 计算的剩余额度；
 - `parent_key`：该桶当前父桶（根桶为 `null`）。
 
-### 6. 哈希审计链
+### 7. 哈希审计链
 
-每次**首次消费判定**（放行 `200` 或拒绝 `429`）、**首次成功释放**与**首次成功
-调整**，都在各自的原写事务内（同提交、同回滚）向仅追加的 `audit_log` 追加一条
-记录；幂等重放直接返回固化结果，**不重复记录**；失败的释放/调整
-（`404`/`409`/`429`）事务回滚，也不会留痕。
+每次**首次消费判定**（放行 `200` 或拒绝 `429`）、**首次成功释放**、**首次成功
+调整**，以及预留的**首次创建成功**（`201`）与**最终状态变更**
+（确认/取消/惰性过期），都在各自的原写事务内（同提交、同回滚）向仅追加的
+`audit_log` 追加一条记录；幂等重放直接返回固化结果，**不重复记录**；失败的
+释放/调整/预留操作（`404`/`409`/`429`）事务回滚，也不会留痕。
 
 链规则：
 
@@ -293,10 +409,10 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 
 | 字段 | 含义 |
 | --- | --- |
-| `op` | 操作类型：`consume`（消费判定）/ `release`（成功释放）/ `adjust`（成功调整） |
-| `business_id` | 业务 ID：`consume` 取 `request_id`，`release` 取 `release_id`，`adjust` 取 `adjustment_id` |
-| `result` | 结果：`allowed` / `denied` / `released` / `adjusted` |
-| `occurred_at` | 发生时间（epoch 秒，与判定/释放/调整时刻一致） |
+| `op` | 操作类型：`consume`（消费判定）/ `release`（成功释放）/ `adjust`（成功调整）/ `reserve`（预留创建与终态变更） |
+| `business_id` | 业务 ID：`consume` 取 `request_id`，`release` 取 `release_id`，`adjust` 取 `adjustment_id`，`reserve` 取 `reservation_id`（创建与终态两条共用同一 ID） |
+| `result` | 结果：`allowed` / `denied` / `released` / `adjusted` / `reserved` / `confirmed` / `cancelled` / `expired` |
+| `occurred_at` | 发生时间（epoch 秒，与判定/释放/调整/预留创建或终态变更时刻一致） |
 
 按 `seq` 翻页查询（游标为上次最后一条的 `seq`，响应同时给出当前链头）：
 
@@ -327,6 +443,11 @@ curl "http://localhost:8000/v1/audit?after_seq=0&limit=100"
 - `limit`：每页条数，默认 `100`，范围 `1..1000`；
 - 空链的链头为 `{"seq": 0, "hash": "0000…0000"}`（64 个 0）。
 
+> 预留产生成对记录：创建成功为 `{"op": "reserve", "result": "reserved"}`，
+> 最终状态变更为同一 `business_id`（`reservation_id`）下的
+> `confirmed` / `cancelled` / `expired` 之一；惰性过期的记录发生在后续相关
+> 操作触发清理的那个事务中，`occurred_at` 为实际清理时刻。
+
 全链重算校验（逐条核对 `seq` 连续性、`prev_hash` 链接与 SHA-256 重算值）：
 
 ```bash
@@ -341,7 +462,7 @@ curl http://localhost:8000/v1/audit/verify
 
 发现篡改/断链时 `valid` 为 `false`，`first_invalid_seq` 给出最早失配记录的 `seq`。
 
-### 7. 历史回放模拟（候选配置试算）
+### 8. 历史回放模拟（候选配置试算）
 
 评估"如果桶当时用的是另一套 limit/window 配置，历史消费的判定会怎样变化"。
 接口在**隔离内存**中重算，**只读**数据库（桶配置 + 首次消费固化记录），
@@ -423,6 +544,9 @@ curl -X POST http://localhost:8000/v1/quota/simulations \
 | `POST` | `/v1/quota/consume` | 多桶检查 + 扣减；`200` 放行 / `429` 超限 / `409` 幂等冲突 / `404` 桶未配置 |
 | `POST` | `/v1/quota/releases` | 释放一次已放行消费；`200` 成功或重放 / `409` 冲突 / `404` 原请求不存在 |
 | `POST` | `/v1/quota/adjustments` | 原子替换一次已放行且未释放消费的桶贡献；`200` 成功或重放 / `429` 目标超限（原贡献保留） / `409` 幂等冲突或请求不可调整 / `404` 原请求或目标桶不存在 |
+| `POST` | `/v1/quota/reservations` | 创建预留：提交桶列表与 `expires_in`，单事务展开贡献链立即占用；`201` 成功或重放 / `429` 任一层不足（零占用，可重试） / `409` 改换载荷或键撞车 / `404` 桶未配置 |
+| `POST` | `/v1/quota/reservations/{reservation_id}/confirm` | 确认生效预留为正式消费（不二次扣量）；`200` 成功或重放 / `409` 终态冲突或改指 / `404` 预留不存在 |
+| `POST` | `/v1/quota/reservations/{reservation_id}/cancel` | 取消生效预留，释放整条贡献链；`200` 成功或重放 / `409` 终态冲突或改指 / `404` 预留不存在 |
 | `POST` | `/v1/quota/simulations` | 隔离内存回放历史消费评估候选配置；`200` 试算结果 / `422` 未知桶、非法范围或跨度超 7 天 |
 | `GET` | `/v1/buckets/{key}/usage` | 查询桶当前滚动窗口用量（`direct_used`/`total_used`/`used`） |
 | `PUT` | `/v1/buckets/{key}` | 创建或更新桶（`limit`、`window_seconds`、可选 `parent_key`）；自引用/缺失父桶/成环返回 `422` |
@@ -487,10 +611,39 @@ curl -X POST http://localhost:8000/v1/quota/simulations \
   `requests` 中固化的首次判定，故释放以现存事件为准撤销**当前（可能已被
   调整）的贡献链**，`released_buckets` 同样仅由现存 `direct=1` 事件汇总；
   调整后重放原 `consume` 仍命中固化判定，不会把已搬走的贡献重新扣回原桶。
+- **预留的存储与状态机**：`reservations` 表以 `reservation_id` 为主键，
+  `status ∈ {reserved, confirmed, cancelled, expired}`（后三者互斥终态），
+  固化规范化载荷（桶列表 + `expires_in`）的 SHA-256 与首次创建结果。创建时
+  写入的占用事件与正式消费事件同在 `usage_events` 中（参与同一套窗口求和，
+  故不会超卖），仅以非空 `reservation_id` 列标记归属。确认在单个写事务内
+  条件 `UPDATE ... SET status='confirmed' WHERE status='reserved'
+  AND expires_at > now` 抢占终态，随后 `UPDATE usage_events SET
+  reservation_id=NULL` 原地转正——金额与 `created_at`（创建时刻）不变，
+  **不二次扣量**；同时写入与 `consume` 同形的 `requests` 固化判定，使确认后
+  的预留可被 `releases`/`adjustments` 处理、同 ID 的 `consume` 重放不重复扣。
+  取消先条件抢占 `cancelled` 终态、再按 `reservation_id` 删除整条贡献链
+  （`events_reverted` 含直接与全部祖先事件）。
+- **预留终态的并发互斥与惰性过期**：确认、取消与过期清理的终态转移全部由
+  `BEGIN IMMEDIATE` 串行化 + 带 `status='reserved' AND expires_at > now`
+  条件的 UPDATE 保证仅一个 `rowcount=1`。过期无后台任务：
+  `consume`/`releases`/`adjustments`/创建预留进入写事务前执行全局惰性清理，
+  确认/取消先对目标预留做定向清理；每条过期预留在**独立短事务**内完成
+  "条件抢占 `expired` → 删除整条占用链 → 追加 `reserve/expired` 审计"，
+  与紧随其后的主事务互不污染。主事务内对目标预留再带条件复查一次，关闭
+  清理与主事务之间的竞争窗口。
+- **预留幂等与命名空间**：创建以 `reservation_id`、确认以 `confirm_id`、
+  取消以 `cancel_id` 分别固化（`reservation_confirmations` /
+  `reservation_cancellations` 表），同键同目标重放原样返回并带
+  `X-Idempotent-Replay: true`，改指其他预留返回 409；创建载荷哈希覆盖
+  规范化桶列表**与 `expires_in`**，任一变化返回 409；创建 `429` 不固化、
+  可同 ID 重试。`reservation_id` 与消费 `request_id` 共享同一幂等键空间
+  （预留事件以 `reservation_id` 作为 `request_id` 落盘），双向撞键均 409。
 - **审计链**：`audit_log` 为仅追加表，`seq` 由 SQLite AUTOINCREMENT 全局递增。
   首次判定在固化 `requests` 之后、首次成功释放在写入 `releases` 之后、首次成功
-  调整在写入 `adjustments` 之后，于**同一 `BEGIN IMMEDIATE` 事务**内追加审计
-  记录——业务回滚则审计不生效，二者不可能分离；幂等重放走不写入审计的独立分支。
+  调整在写入 `adjustments` 之后、预留首次创建成功在写入 `reservations` 之后、
+  预留终态变更（确认/取消在各自幂等表写入之后，过期在清理短事务内），于
+  **同一写事务**内追加审计记录——业务回滚则审计不生效，二者不可能分离；
+  幂等重放走不写入审计的独立分支。
   追加时先读链尾 `hash` 作为 `prev_hash`，按
   `SHA-256(bytes.fromhex(prev_hash) + canonical_json(event))` 计算当前 `hash`，
   写事务串行化保证链头读取与追加之间无并发分叉。`GET /v1/audit/verify` 从 64 个 0
@@ -536,4 +689,16 @@ PUT 的 parent_key 增删改查、自引用/缺失父桶/直接环与间接环�
 整条链（含共享祖先仅删一次汇总）、调整按同规则替换/搬移整条链并校验祖先、
 未知目标 404 保链、树消费幂等重放不重复累计、30 并发不突破祖先限额、
 树场景审计语义不变、回放模拟的祖先拒绝/峰值与共享祖先不重复，以及播种
-乱序父子与坏配置（缺父）整批回滚，共 92 个用例。
+乱序父子与坏配置（缺父）整批回滚；预留生命周期覆盖整链立即占用与
+`reserved_used` 用量、祖先层不足 all-or-nothing 零占用、占用挡住消费的
+429（含 Retry-After）与 429 不固化可同 ID 重试、未知桶 404、同载荷重放
+201 不重复占用、改桶/改金额/改 `expires_in` 409、与 consume 的 ID 双向撞键
+409、确认原地转正不二次扣量（用量不变、占用标记归零）、确认后可被
+releases 撤销且同 ID consume 重放不重复扣、确认/取消的幂等重放与改指
+409、重复确认/取消与终态冲突 409、404 分支、取消释放整条链（含祖先）、
+过期在 consume/新建预留中惰性释放（事件删除、状态 expired、容量恢复）、
+过期后确认/取消 409、过期边界竞争终态唯一、20 确认 + 20 取消并发恰好一个
+终态、同 confirm_id 并发只确认一次、同 reservation_id 并发只占用一次、
+审计链中创建与终态各一条（reserved/confirmed/cancelled/expired）且失败不留痕、
+422 校验分支，以及旧库增量迁移（`usage_events.reservation_id` 列与预留表、
+旧事件视为正式消费），共 112 个用例。

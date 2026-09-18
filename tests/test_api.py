@@ -2040,3 +2040,499 @@ def test_seed_tree_out_of_order_and_bad_config_rejected():
     finally:
         conn.close()
     assert row[0] == 1 and row[1] == "s-mid"
+
+
+# ---------------------------------------------------------------- 预留生命周期
+
+def _reserve(rev: str, items, expires_in: float = 60.0):
+    return client.post("/v1/quota/reservations", json={
+        "reservation_id": rev,
+        "buckets": [{"key": k, "amount": a} for k, a in items],
+        "expires_in": expires_in,
+    })
+
+
+def _confirm(rev: str, confirm_id: str | None = None):
+    return client.post(
+        f"/v1/quota/reservations/{rev}/confirm",
+        json={"confirm_id": confirm_id or _rid()},
+    )
+
+
+def _cancel(rev: str, cancel_id: str | None = None):
+    return client.post(
+        f"/v1/quota/reservations/{rev}/cancel",
+        json={"cancel_id": cancel_id or _rid()},
+    )
+
+
+def test_reservation_create_occupies_full_chain():
+    """创建预留：立即占用整条贡献链（叶 + 祖先），返回过期时刻。"""
+    root, mid, leaf = _tree3()
+    rev = _rid()
+    r = _reserve(rev, [(leaf, 2)])
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["reserved"] is True
+    assert body["reservation_id"] == rev
+    assert body["buckets"] == [{"key": leaf, "amount": 2}]
+    assert body["events_reserved"] == 3  # leaf + mid + root
+    assert body["expires_at"] > body["reserved_at"]
+    assert "X-Idempotent-Replay" not in r.headers
+
+    for k in (root, mid, leaf):
+        u = client.get(f"/v1/buckets/{k}/usage").json()
+        assert u["used"] == 2 and u["reserved_used"] == 2
+
+
+def test_reservation_insufficient_capacity_all_or_nothing():
+    """任一层（含祖先）不足：429、整体零占用、预留未固化。"""
+    root, mid, leaf = _tree3(root_limit=1, mid_limit=1000, leaf_limit=1000)
+    r = _reserve(_rid(), [(leaf, 2)])
+    assert r.status_code == 429
+    body = r.json()
+    assert body["reserved"] is False
+    assert [b["key"] for b in body["limited_buckets"]] == [root]
+    assert body["retry_at"] is None  # 层限额本身容不下请求量
+    assert "Retry-After" not in r.headers
+    for k in (root, mid, leaf):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["used"] == 0
+
+
+def test_reservation_holds_block_consume_and_429_retryable():
+    """预留占用容量：正式消费被 429；创建 429 不固化，额度释放后同 ID 可重试。"""
+    key = _bucket(5, 60)
+    rev_full = _rid()
+    assert _reserve(rev_full, [(key, 4)]).status_code == 201
+    assert client.get(f"/v1/buckets/{key}/usage").json()["reserved_used"] == 4
+
+    r = _consume(_rid(), key, 2)
+    assert r.status_code == 429
+    assert r.json()["limited_buckets"][0]["used"] == 4
+    assert r.json()["retry_after_seconds"] is not None
+    assert "Retry-After" in r.headers
+
+    # 新预留容量不足：429 且未固化（取消占满的旧预留后同 ID 重试成功）
+    rev_new = _rid()
+    assert _reserve(rev_new, [(key, 5)]).status_code == 429
+    assert _cancel(rev_full).status_code == 200
+    r = _reserve(rev_new, [(key, 5)])
+    assert r.status_code == 201, r.text
+    assert r.json()["events_reserved"] == 1
+
+
+def test_reservation_unknown_bucket_404():
+    rev = _rid()
+    r = client.post("/v1/quota/reservations", json={
+        "reservation_id": rev,
+        "buckets": [{"key": "no-such-bucket", "amount": 1}],
+        "expires_in": 60,
+    })
+    assert r.status_code == 404
+
+
+def test_reservation_idempotent_replay_same_payload():
+    """同 reservation_id 同载荷重放：201 原样返回、不重复占用。"""
+    key = _bucket(10, 60)
+    rev = _rid()
+    payload = {
+        "reservation_id": rev,
+        "buckets": [{"key": key, "amount": 3}],
+        "expires_in": 60,
+    }
+    r1 = client.post("/v1/quota/reservations", json=payload)
+    assert r1.status_code == 201
+    r2 = client.post("/v1/quota/reservations", json=payload)
+    assert r2.status_code == 201
+    assert r2.json() == r1.json()
+    assert r2.headers.get("X-Idempotent-Replay") == "true"
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 3
+
+
+def test_reservation_changed_payload_conflict():
+    """同 reservation_id 改换桶或 expires_in：409。"""
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rev = _rid()
+    assert _reserve(rev, [(k1, 1)]).status_code == 201
+    assert _reserve(rev, [(k1, 2)]).status_code == 409
+    assert _reserve(rev, [(k2, 1)]).status_code == 409
+    # 仅 expires_in 变化也算改换载荷
+    r = client.post("/v1/quota/reservations", json={
+        "reservation_id": rev,
+        "buckets": [{"key": k1, "amount": 1}],
+        "expires_in": 30,
+    })
+    assert r.status_code == 409
+    # 冲突不改变占用
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 1
+
+
+def test_reservation_id_clashes_with_consume_request_id():
+    """reservation_id 与已存在 request_id 撞键：创建 409；反之亦然。"""
+    key = _bucket(10, 60)
+    shared = _rid()
+    assert _consume(shared, key, 1).status_code == 200
+    assert _reserve(shared, [(key, 1)]).status_code == 409
+
+    rev = _rid()
+    assert _reserve(rev, [(key, 1)]).status_code == 201
+    assert _consume(rev, key, 1).status_code == 409
+
+
+def test_reservation_confirm_commits_without_double_deduction():
+    """确认：占用转正式消费、不二次扣量；可被 releases 处理。"""
+    root, mid, leaf = _tree3()
+    rev = _rid()
+    assert _reserve(rev, [(leaf, 3)]).status_code == 201
+
+    cid = _rid()
+    r = client.post(f"/v1/quota/reservations/{rev}/confirm",
+                    json={"confirm_id": cid})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["confirmed"] is True
+    assert body["buckets"] == [{"key": leaf, "amount": 3}]
+    assert body["events_committed"] == 3  # 整条链原地转正
+    assert "X-Idempotent-Replay" not in r.headers
+
+    # 用量不变（未二次扣量），但已无预留占用标记
+    for k in (root, mid, leaf):
+        u = client.get(f"/v1/buckets/{k}/usage").json()
+        assert u["used"] == 3 and u["reserved_used"] == 0
+
+    # 确认幂等：同 confirm_id 重放原样返回
+    r2 = client.post(f"/v1/quota/reservations/{rev}/confirm",
+                     json={"confirm_id": cid})
+    assert r2.status_code == 200
+    assert r2.json() == body
+    assert r2.headers.get("X-Idempotent-Replay") == "true"
+    for k in (root, mid, leaf):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["used"] == 3
+
+    # 确认后的预留作为普通消费：consume 同 ID 重放命中固化判定，不重复扣
+    r3 = _consume(rev, leaf, 3)
+    assert r3.status_code == 200
+    assert r3.headers.get("X-Idempotent-Replay") == "true"
+    assert r3.json()["granted"] == [{"key": leaf, "amount": 3}]
+    for k in (root, mid, leaf):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["used"] == 3
+
+    # releases 可撤销确认转正后的整条链
+    assert _release(_rid(), rev).status_code == 200
+    for k in (root, mid, leaf):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["used"] == 0
+
+
+def test_reservation_confirm_terminal_conflicts():
+    """重复确认（新 confirm_id）/确认已取消/确认不存在：409/409/404。"""
+    key = _bucket(10, 60)
+    rev = _rid()
+    assert _reserve(rev, [(key, 1)]).status_code == 201
+    assert _confirm(rev).status_code == 200
+    assert _confirm(rev).status_code == 409
+    assert _cancel(rev).status_code == 409
+
+    rev2 = _rid()
+    assert _reserve(rev2, [(key, 1)]).status_code == 201
+    assert _cancel(rev2).status_code == 200
+    assert _confirm(rev2).status_code == 409
+
+    assert _confirm(f"ghost-{_rid()}").status_code == 404
+    assert _cancel(f"ghost-{_rid()}").status_code == 404
+
+
+def test_reservation_confirm_id_retarget_conflict():
+    """同一 confirm_id 改指其他预留：409。"""
+    key = _bucket(10, 60)
+    rev1, rev2 = _rid(), _rid()
+    assert _reserve(rev1, [(key, 1)]).status_code == 201
+    assert _reserve(rev2, [(key, 1)]).status_code == 201
+    cid = _rid()
+    assert client.post(f"/v1/quota/reservations/{rev1}/confirm",
+                       json={"confirm_id": cid}).status_code == 200
+    r = client.post(f"/v1/quota/reservations/{rev2}/confirm",
+                    json={"confirm_id": cid})
+    assert r.status_code == 409
+
+
+def test_reservation_cancel_releases_full_chain():
+    """取消：删除整条贡献链（含祖先汇总），用量即刻恢复。"""
+    root, mid, leaf = _tree3()
+    rev = _rid()
+    assert _reserve(rev, [(leaf, 4)]).status_code == 201
+
+    kid = _rid()
+    r = client.post(f"/v1/quota/reservations/{rev}/cancel",
+                    json={"cancel_id": kid})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["cancelled"] is True
+    assert body["released_buckets"] == [{"key": leaf, "amount": 4}]
+    assert body["events_reverted"] == 3  # 整条链
+    for k in (root, mid, leaf):
+        assert client.get(f"/v1/buckets/{k}/usage").json()["used"] == 0
+
+    # 幂等重放
+    r2 = client.post(f"/v1/quota/reservations/{rev}/cancel",
+                     json={"cancel_id": kid})
+    assert r2.status_code == 200
+    assert r2.json() == body
+    assert r2.headers.get("X-Idempotent-Replay") == "true"
+
+    # 释放出的额度可供新预留/消费使用
+    assert _reserve(_rid(), [(leaf, 4)]).status_code == 201
+
+
+def test_reservation_cancel_id_retarget_conflict():
+    key = _bucket(10, 60)
+    rev1, rev2 = _rid(), _rid()
+    assert _reserve(rev1, [(key, 1)]).status_code == 201
+    assert _reserve(rev2, [(key, 1)]).status_code == 201
+    kid = _rid()
+    assert client.post(f"/v1/quota/reservations/{rev1}/cancel",
+                       json={"cancel_id": kid}).status_code == 200
+    r = client.post(f"/v1/quota/reservations/{rev2}/cancel",
+                    json={"cancel_id": kid})
+    assert r.status_code == 409
+
+
+def test_reservation_expired_is_lazily_released_on_consume():
+    """过期预留下次相关操作（consume）中惰性释放：事件删除、状态 expired。"""
+    key = _bucket(5, 60)
+    rev = _rid()
+    assert _reserve(rev, [(key, 5)], expires_in=0.3).status_code == 201
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 5
+    time.sleep(0.4)
+
+    # 过期后确认/取消均被拒（终态只能是 expired）
+    assert _confirm(rev).status_code == 409
+    assert _cancel(rev).status_code == 409
+
+    # consume 触发全局惰性释放，容量恢复
+    assert _consume(_rid(), key, 5).status_code == 200
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 5
+
+    from app.db import connect as _connect
+    from app import config
+    conn = _connect(config.DB_PATH)
+    try:
+        status = conn.execute(
+            "SELECT status FROM reservations WHERE reservation_id = ?", (rev,)
+        ).fetchone()[0]
+        events = conn.execute(
+            "SELECT COUNT(*) FROM usage_events WHERE reservation_id = ?", (rev,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert status == "expired"
+    assert events == 0
+
+
+def test_reservation_expired_lazily_released_on_new_reservation():
+    """创建新预留同样触发全局惰性释放。"""
+    key = _bucket(5, 60)
+    rev = _rid()
+    assert _reserve(rev, [(key, 5)], expires_in=0.3).status_code == 201
+    time.sleep(0.4)
+    # 旧预留恰好占满：惰性释放后新预留可成功，否则会 429
+    r = _reserve(_rid(), [(key, 5)])
+    assert r.status_code == 201, r.text
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 5
+
+
+def test_reservation_expired_confirm_race_single_terminal():
+    """确认恰在过期时刻：要么 confirmed 要么 expired，二者只居其一。"""
+    key = _bucket(5, 60)
+    rev = _rid()
+    assert _reserve(rev, [(key, 1)], expires_in=0.3).status_code == 201
+    time.sleep(0.4)
+    code = _confirm(rev).status_code
+    assert code in (200, 409)
+    from app.db import connect as _connect
+    from app import config
+    conn = _connect(config.DB_PATH)
+    try:
+        status = conn.execute(
+            "SELECT status FROM reservations WHERE reservation_id = ?", (rev,)
+        ).fetchone()[0]
+        events_held = conn.execute(
+            "SELECT COUNT(*) FROM usage_events WHERE reservation_id = ?", (rev,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    if code == 200:
+        assert status == "confirmed" and events_held == 0
+    else:
+        assert status == "expired" and events_held == 0
+    # 被确认的预留可释放；过期的则容量已自动恢复
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 0
+
+
+def test_concurrent_confirm_and_cancel_only_one_terminal():
+    """20 路确认 + 20 路取消并发：恰好一个终态，其余 409，不重复扣量。"""
+    key = _bucket(100, 60)
+    rev = _rid()
+    assert _reserve(rev, [(key, 5)]).status_code == 201
+
+    outcomes: list[tuple[str, int]] = []
+    barrier = threading.Barrier(40)
+
+    def confirm_hit():
+        cid = f"c-{_rid()}"
+        barrier.wait()
+        outcomes.append(("confirm", _confirm(rev, cid).status_code))
+
+    def cancel_hit():
+        kid = f"x-{_rid()}"
+        barrier.wait()
+        outcomes.append(("cancel", _cancel(rev, kid).status_code))
+
+    threads = [threading.Thread(target=confirm_hit) for _ in range(20)]
+    threads += [threading.Thread(target=cancel_hit) for _ in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    oks = [op for op, c in outcomes if c == 200]
+    assert len(oks) == 1, outcomes
+    terminal = oks[0]
+    assert [c for _, c in outcomes].count(409) == 39
+
+    from app.db import connect as _connect
+    from app import config
+    conn = _connect(config.DB_PATH)
+    try:
+        status = conn.execute(
+            "SELECT status FROM reservations WHERE reservation_id = ?", (rev,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    if terminal == "confirm":
+        assert status == "confirmed"
+        assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 5
+    else:
+        assert status == "cancelled"
+        assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 0
+
+
+def test_concurrent_same_confirm_id_single_application():
+    """同一 confirm_id 并发：全部 200，只确认一次。"""
+    key = _bucket(10, 60)
+    rev = _rid()
+    assert _reserve(rev, [(key, 2)]).status_code == 201
+    cid = _rid()
+    codes = []
+    barrier = threading.Barrier(15)
+
+    def hit():
+        barrier.wait()
+        codes.append(client.post(
+            f"/v1/quota/reservations/{rev}/confirm",
+            json={"confirm_id": cid},
+        ).status_code)
+
+    threads = [threading.Thread(target=hit) for _ in range(15)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(c == 200 for c in codes)
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 2
+    assert client.get(f"/v1/buckets/{key}/usage").json()["reserved_used"] == 0
+
+
+def test_reservation_concurrent_creates_only_one_holds():
+    """同一 reservation_id 并发创建：全部 201，只占用一次。"""
+    key = _bucket(100, 60)
+    rev = _rid()
+    payload = {
+        "reservation_id": rev,
+        "buckets": [{"key": key, "amount": 7}],
+        "expires_in": 60,
+    }
+    codes = []
+    barrier = threading.Barrier(15)
+
+    def hit():
+        barrier.wait()
+        codes.append(client.post("/v1/quota/reservations", json=payload).status_code)
+
+    threads = [threading.Thread(target=hit) for _ in range(15)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(c == 201 for c in codes)
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 7
+
+
+def test_reservation_audit_chain_lifecycle():
+    """审计链：创建成功与最终状态变更各记一条；重放与失败不留痕。"""
+    key = _bucket(10, 60)
+
+    # 成功创建 + 确认：两条
+    rev = _rid()
+    assert _reserve(rev, [(key, 1)]).status_code == 201
+    assert _confirm(rev).status_code == 200
+
+    # 成功创建 + 取消：两条
+    rev2 = _rid()
+    assert _reserve(rev2, [(key, 1)]).status_code == 201
+    assert _cancel(rev2).status_code == 200
+
+    # 失败创建（429/404）与确认/取消失败不留痕
+    assert _reserve(_rid(), [(key, 99)]).status_code == 429
+    assert _confirm(f"ghost-{_rid()}").status_code == 404
+
+    # 过期惰性释放：一条 expired
+    rev3 = _rid()
+    assert _reserve(rev3, [(key, 1)], expires_in=0.3).status_code == 201
+    time.sleep(0.4)
+    assert _consume(_rid(), key, 1).status_code == 200
+
+    audit_records = {
+        (r["event"]["business_id"], r["event"]["result"]): r["event"]["op"]
+        for r in _audit().json()["records"]
+    }
+    assert audit_records[(rev, "reserved")] == "reserve"
+    assert audit_records[(rev, "confirmed")] == "reserve"
+    assert audit_records[(rev2, "reserved")] == "reserve"
+    assert audit_records[(rev2, "cancelled")] == "reserve"
+    assert audit_records[(rev3, "reserved")] == "reserve"
+    assert audit_records[(rev3, "expired")] == "reserve"
+
+    # 同预留至多两条（创建 + 终态）
+    rev_events = [
+        r for r in _audit().json()["records"]
+        if r["event"]["business_id"] == rev
+    ]
+    assert [r["event"]["result"] for r in rev_events] == ["reserved", "confirmed"]
+
+    verify = client.get("/v1/audit/verify").json()
+    assert verify["valid"] is True
+
+
+def test_reservation_validation_errors():
+    key = _bucket(5, 60)
+    # expires_in 必须为正
+    r = client.post("/v1/quota/reservations", json={
+        "reservation_id": _rid(),
+        "buckets": [{"key": key, "amount": 1}],
+        "expires_in": 0,
+    })
+    assert r.status_code == 422
+    # buckets 不能为空
+    r = client.post("/v1/quota/reservations", json={
+        "reservation_id": _rid(), "buckets": [], "expires_in": 60,
+    })
+    assert r.status_code == 422
+    # confirm/cancel 缺幂等键
+    rev = _rid()
+    assert _reserve(rev, [(key, 1)]).status_code == 201
+    assert client.post(
+        f"/v1/quota/reservations/{rev}/confirm", json={}
+    ).status_code == 422
+    assert client.post(
+        f"/v1/quota/reservations/{rev}/cancel", json={}
+    ).status_code == 422
