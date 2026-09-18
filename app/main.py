@@ -1,4 +1,4 @@
-"""FastAPI 入口：多桶滚动配额判定 API（支持多级配额树）。
+"""FastAPI 入口：多桶滚动配额判定 API（支持多级配额树与预留生命周期）。
 
 核心保证：
 - 同一请求的所有桶在单个 BEGIN IMMEDIATE 事务内"检查 + 扣减"，
@@ -16,10 +16,20 @@
   任一未知桶或超限则原贡献不变，全部通过才原子替换整条贡献链；
   首次成功调整在原事务追加一条审计记录，同 adjustment_id 同载荷
   重放原样返回、改换载荷返回 409；
-- 释放撤销的是该请求当前（可能已被调整）的整条贡献链。
+- 释放撤销的是该请求当前（可能已被调整）的整条贡献链；
+- 预留生命周期：POST /v1/quota/reservations 提交桶列表与 expires_in，
+  在单个写事务内按当前配额树展开整条贡献链并立即占用容量，任一层
+  不足则整体失败（429，不占用）；confirm 把有效预留转为正式消费
+  （事件转挂、写入 requests 固化，不二次扣量），cancel 释放整条
+  贡献链；过期 held 预留在后续相关操作（消费/预留创建/确认/取消/
+  查询）的写事务内惰性释放。确认、取消与过期清理并发时终态唯一，
+  重复请求幂等原样返回、改换载荷（含改指 request_id）返回 409。
+  审计链记录首次创建成功（reserve/reserved）与每个预留的最终状态
+  变更（confirmed/cancelled/expired）。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -28,7 +38,7 @@ import sqlite3
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import audit, config, simulation
@@ -46,6 +56,8 @@ from .schemas import (
     BucketConfig,
     ConsumeRequest,
     ReleaseRequest,
+    ReservationConfirmRequest,
+    ReservationRequest,
     SimulationRequest,
 )
 
@@ -151,25 +163,30 @@ def _check_contributions(
 
 def _insert_contribution_events(
     conn: sqlite3.Connection,
-    request_id: str,
+    request_id: str | None,
     contributions: dict[str, dict[str, int]],
     created_at: float,
+    reservation_id: str | None = None,
 ) -> None:
-    """按展开结果写入整条贡献链事件：每桶至多 direct/rollup 各一条。"""
+    """按展开结果写入整条贡献链事件：每桶至多 direct/rollup 各一条。
+
+    正式消费（含已确认预留）带 ``request_id``；持有中的预留带
+    ``reservation_id`` 且 ``request_id`` 为 NULL，二者互斥。
+    """
     for key, parts in contributions.items():
         if parts["direct"]:
             conn.execute(
                 "INSERT INTO usage_events "
-                "(bucket_key, request_id, amount, created_at, direct) "
-                "VALUES (?, ?, ?, ?, 1)",
-                (key, request_id, parts["direct"], created_at),
+                "(bucket_key, request_id, reservation_id, amount, created_at, "
+                " direct) VALUES (?, ?, ?, ?, ?, 1)",
+                (key, request_id, reservation_id, parts["direct"], created_at),
             )
         if parts["rollup"]:
             conn.execute(
                 "INSERT INTO usage_events "
-                "(bucket_key, request_id, amount, created_at, direct) "
-                "VALUES (?, ?, ?, ?, 0)",
-                (key, request_id, parts["rollup"], created_at),
+                "(bucket_key, request_id, reservation_id, amount, created_at, "
+                " direct) VALUES (?, ?, ?, ?, ?, 0)",
+                (key, request_id, reservation_id, parts["rollup"], created_at),
             )
 
 
@@ -185,6 +202,140 @@ def _direct_items_for_request(
     return merge_items(
         [{"key": r["bucket_key"], "amount": r["amount"]} for r in rows]
     )
+
+
+# ---------------------------------------------------------------- 预留工具
+
+# 预留状态机：held（持有）→ confirmed / cancelled / expired（三个互斥终态）
+RESERVATION_HELD = "held"
+RESERVATION_CONFIRMED = "confirmed"
+RESERVATION_CANCELLED = "cancelled"
+RESERVATION_EXPIRED = "expired"
+
+
+def reservation_payload_hash(items: list[dict], expires_in: float) -> str:
+    """对规范化桶列表 + expires_in 取哈希，作为预留幂等比对依据。"""
+    canonical = json.dumps(
+        {"buckets": items, "expires_in": expires_in},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _sweep_expired_reservations(
+    conn: sqlite3.Connection, now: float
+) -> list[str]:
+    """惰性释放所有已到期的 held 预留，返回本次实际过期的 reservation_id。
+
+    必须在已开启的写事务（BEGIN IMMEDIATE）内调用：对每个到期预留删除其
+    整条贡献链（usage_events 中以 reservation_id 标记的占用事件）、置
+    status='expired' 并在**同一事务**追加一条 reserve/expired 审计。
+    写事务串行化保证"确认/取消/过期"并发时只有一个终态成立——竞争者在
+    本事务提交后再读到的即为终态行。
+    """
+    expired_rows = conn.execute(
+        "SELECT reservation_id FROM reservations "
+        "WHERE status = 'held' AND expires_at <= ? "
+        "ORDER BY expires_at, reservation_id",
+        (now,),
+    ).fetchall()
+    expired_ids: list[str] = []
+    for r in expired_rows:
+        reservation_id = r["reservation_id"]
+        # 删除该预留持有的整条贡献链（直接桶 + 全部祖先）
+        conn.execute(
+            "DELETE FROM usage_events WHERE reservation_id = ?",
+            (reservation_id,),
+        )
+        # 条件 UPDATE 兜底并发：只允许 held → expired 的状态迁移
+        cur = conn.execute(
+            "UPDATE reservations SET status = 'expired', finalized_at = ? "
+            "WHERE reservation_id = ? AND status = 'held'",
+            (now, reservation_id),
+        )
+        if cur.rowcount != 1:  # pragma: no cover - 串行化下理论不可达
+            continue
+        result = {
+            "reservation_id": reservation_id,
+            "status": RESERVATION_EXPIRED,
+            "expired_at": now,
+        }
+        conn.execute(
+            "UPDATE reservations SET terminal_result = ? WHERE reservation_id = ?",
+            (json.dumps(result), reservation_id),
+        )
+        audit.append_event(
+            conn,
+            op=audit.OP_RESERVE,
+            business_id=reservation_id,
+            result=audit.RESULT_EXPIRED,
+            occurred_at=now,
+        )
+        expired_ids.append(reservation_id)
+    return expired_ids
+
+
+def _reservation_state_conflict(reservation_id: str, status: str) -> HTTPException:
+    """构造预留当前状态不允许目标操作的 409（终态唯一性）。"""
+    return HTTPException(
+        status_code=409,
+        detail=(
+            f"预留 '{reservation_id}' 当前状态为 '{status}'，"
+            "该操作不适用；同一预留的确认/取消/过期只能有一个终态"
+        ),
+    )
+
+
+def _expire_due_reservations(now: float) -> list[str]:
+    """在主业务事务**之前**惰性释放到期预留。
+
+    先做一次只读探测（WAL 下不阻塞读写）：没有到期 held 预留时直接返回，
+    **不开启写事务**，从而不会把普通 consume 无谓串行化；确有到期行时才
+    ``BEGIN IMMEDIATE`` 清扫并独立提交，使释放不随后续业务失败
+    （404/409/429）一起回滚。随后主事务重新串行入队，读到的即为最新终态。
+
+    探测与清扫之间不会漏掉"本次应释放"的预留：``expires_in > 0`` 决定了
+    ``expires_at <= now`` 的预留必然创建于 now 之前并已提交。
+    """
+    probe = connect()
+    try:
+        due = probe.execute(
+            "SELECT 1 FROM reservations "
+            "WHERE status = 'held' AND expires_at <= ? LIMIT 1",
+            (now,),
+        ).fetchone()
+    finally:
+        probe.close()
+    if due is None:
+        return []
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            expired = _sweep_expired_reservations(conn, now)
+            conn.execute("COMMIT")
+        except Exception:
+            _rollback_quietly(conn)
+            raise
+    finally:
+        conn.close()
+    return expired
+
+
+def _reservation_response(row: sqlite3.Row) -> dict:
+    """由 reservations 行组装状态查询响应。"""
+    return {
+        "reservation_id": row["reservation_id"],
+        "status": row["status"],
+        "buckets": json.loads(row["payload"])["buckets"],
+        "expires_in": row["expires_in"],
+        "expires_at": row["expires_at"],
+        "request_id": row["request_id"],
+        "created_at": row["created_at"],
+        "finalized_at": row["finalized_at"],
+    }
 
 
 # ---------------------------------------------------------------- 配额判定
@@ -204,6 +355,9 @@ def consume(req: ConsumeRequest):
     payload_json = json.dumps(
         {"request_id": req.request_id, "buckets": items}, sort_keys=True
     )
+
+    # 先在独立事务惰性释放到期预留（独立提交，不随本次判定回滚）
+    _expire_due_reservations(now)
 
     replayed = False
     conn = connect()
@@ -490,6 +644,9 @@ def adjust(req: AdjustmentRequest):
         sort_keys=True,
     )
 
+    # 目标列表的容量校验须排除已到期预留，先在独立事务惰性释放
+    _expire_due_reservations(now)
+
     conn = connect()
     replayed = False
     try:
@@ -663,6 +820,493 @@ def _adjustment_limited_response(result: dict) -> JSONResponse:
     if result.get("retry_after_seconds") is not None:
         headers["Retry-After"] = str(math.ceil(result["retry_after_seconds"]))
     return JSONResponse(status_code=429, content=result, headers=headers)
+
+
+# ---------------------------------------------------------------- 预留生命周期
+
+def _reservation_limited_response(result: dict) -> JSONResponse:
+    """预留创建容量不足：返回与 consume 同形的 429（含 Retry-After）。"""
+    headers = {}
+    if result.get("retry_after_seconds") is not None:
+        headers["Retry-After"] = str(math.ceil(result["retry_after_seconds"]))
+    return JSONResponse(status_code=429, content=result, headers=headers)
+
+
+@app.post("/v1/quota/reservations", status_code=201)
+def create_reservation(req: ReservationRequest):
+    """创建预留：展开整条贡献链并立即占用容量；任一层不足则整体失败。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内完成：先惰性释放已到期预留，再按
+    **当前配额树**展开桶列表（直接桶 + 全部祖先），对每一层做容量校验
+    （窗口用量已包含其他有效预留的占用）；任一直接桶未知（404）或任一
+    层不足（429，含 Retry-After）则整体回滚、不占用任何容量。全部通过
+    才写入以 ``reservation_id`` 标记的整条贡献链事件（request_id 为
+    NULL）、固化预留，并在同一事务追加一条 reserve/reserved 审计。
+
+    - 201：预留创建成功，容量已持有；
+    - 429：贡献链上任一桶容量不足，未做任何占用（不固化，可稍后重试）；
+    - 409：reservation_id 已被不同载荷（桶列表/expires_in）使用；
+    - 404：存在未配置的桶或配额树引用中断。
+
+    同 reservation_id + 同载荷重放原样返回首次创建结果（201），带
+    ``X-Idempotent-Replay: true``，不重复占用。
+    """
+    now = time.time()
+    items = merge_items([i.model_dump() for i in req.buckets])
+    expires_in = float(req.expires_in)
+    phash = reservation_payload_hash(items, expires_in)
+    expires_at = now + expires_in
+    payload_json = json.dumps(
+        {"reservation_id": req.reservation_id,
+         "buckets": items, "expires_in": expires_in},
+        sort_keys=True,
+    )
+
+    # 先在独立事务惰性释放到期预留（独立提交，不随本次创建回滚）
+    _expire_due_reservations(now)
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT payload_hash, result FROM reservations "
+                "WHERE reservation_id = ?",
+                (req.reservation_id,),
+            ).fetchone()
+            if row is not None:
+                if row["payload_hash"] != phash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"reservation_id '{req.reservation_id}' 已被不同载荷"
+                            "使用；幂等键不可复用，请更换 reservation_id"
+                        ),
+                    )
+                result = json.loads(row["result"])
+                replayed = True
+                conn.execute("COMMIT")
+            else:
+                result = _evaluate_and_reserve(
+                    conn, req.reservation_id, items, now, expires_in, expires_at
+                )
+                if not result["reserved"]:
+                    # 容量不足：不写占用事件、不固化预留，回滚保持容量不变
+                    conn.execute("ROLLBACK")
+                else:
+                    conn.execute(
+                        "INSERT INTO reservations "
+                        "(reservation_id, payload_hash, payload, status, "
+                        " request_id, expires_in, expires_at, result, created_at) "
+                        "VALUES (?, ?, ?, 'held', NULL, ?, ?, ?, ?)",
+                        (
+                            req.reservation_id,
+                            phash,
+                            payload_json,
+                            expires_in,
+                            expires_at,
+                            json.dumps(result),
+                            now,
+                        ),
+                    )
+                    # 首次创建成功在同一事务追加审计；重放走已存在分支
+                    audit.append_event(
+                        conn,
+                        op=audit.OP_RESERVE,
+                        business_id=req.reservation_id,
+                        result=audit.RESULT_RESERVED,
+                        occurred_at=now,
+                    )
+                    conn.execute("COMMIT")
+                replayed = False
+        except Exception:
+            _rollback_quietly(conn)
+            raise
+    finally:
+        conn.close()
+
+    if not result["reserved"]:
+        return _reservation_limited_response(result)
+
+    return JSONResponse(
+        status_code=201,
+        content=result,
+        headers={"X-Idempotent-Replay": "true"} if replayed else {},
+    )
+
+
+def _evaluate_and_reserve(
+    conn: sqlite3.Connection,
+    reservation_id: str,
+    items: list[dict],
+    now: float,
+    expires_in: float,
+    expires_at: float,
+) -> dict:
+    """事务内按当前配额树校验并写入预留占用；任一层不足则不占用。"""
+    configs, parents = _bucket_configs(conn)
+    for item in items:
+        if item["key"] not in configs:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"桶 '{item['key']}' 未配置，请先通过 "
+                    f"PUT /v1/buckets/{item['key']} 创建"
+                ),
+            )
+
+    contributions, limited = _check_contributions(
+        conn, items, configs, parents, now
+    )
+
+    if limited:
+        retry_times = [b["retry_at"] for b in limited]
+        overall_retry_at = (
+            max(retry_times) if all(t is not None for t in retry_times) else None
+        )
+        return {
+            "reservation_id": reservation_id,
+            "reserved": False,
+            "limited_buckets": limited,
+            "retry_at": overall_retry_at,
+            "retry_after_seconds": (
+                None if overall_retry_at is None
+                else max(0.0, overall_retry_at - now)
+            ),
+            "decided_at": now,
+        }
+
+    # 占用事件以 reservation_id 标记、request_id 为 NULL；
+    # 窗口求和天然把有效预留计入当前用量，故并发预留不会突破限额
+    _insert_contribution_events(
+        conn, None, contributions, now, reservation_id=reservation_id
+    )
+    return {
+        "reservation_id": reservation_id,
+        "reserved": True,
+        "buckets": items,
+        "expires_in": expires_in,
+        "expires_at": expires_at,
+        "reserved_at": now,
+    }
+
+
+@app.post("/v1/quota/reservations/{reservation_id}/confirm")
+def confirm_reservation(
+    reservation_id: str,
+    req: ReservationConfirmRequest | None = Body(default=None),
+):
+    """确认有效预留：转为正式消费，占用事件转挂而**不二次扣量**。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内：先惰性释放到期预留，再把目标预留
+    的整条贡献链事件从 reservation_id 转挂为正式消费的 request_id（金额、
+    时刻、桶均不变，因此容量零增量），随后写入 ``requests`` 固化判定
+    （allowed=1）、置预留为 confirmed，并在同一事务追加一条
+    reserve/confirmed 审计。
+
+    - 200：确认成功（或同 reservation_id 同 request_id 重放，原样返回并
+      带 X-Idempotent-Replay: true，不二次扣量、不重复审计）；
+    - 404：预留不存在；
+    - 409：预留已取消/已过期（终态冲突）；改换 request_id（幂等冲突）；
+      正式 request_id 已被其他消费占用。
+    """
+    now = time.time()
+    requested_id = req.request_id if req is not None else None
+    formal_id = requested_id or reservation_id
+
+    # 到期预留先在独立事务惰性过期（独立提交，确定释放并留痕）
+    _expire_due_reservations(now)
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT status, request_id, terminal_result FROM reservations "
+                "WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"预留 '{reservation_id}' 不存在，无法确认",
+                )
+
+            if row["status"] == RESERVATION_CONFIRMED:
+                # 幂等重放：同一正式 request_id 原样返回；改换则 409
+                if row["request_id"] != formal_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"预留 '{reservation_id}' 已确认为正式消费 "
+                            f"'{row['request_id']}'，不可改指其他 request_id"
+                        ),
+                    )
+                result = json.loads(row["terminal_result"])
+                replayed = True
+                conn.execute("COMMIT")
+            else:
+                result = _confirm_reservation(
+                    conn, reservation_id, formal_id, now
+                )
+                conn.execute("COMMIT")
+                replayed = False
+        except Exception:
+            _rollback_quietly(conn)
+            raise
+    finally:
+        conn.close()
+
+    return JSONResponse(
+        status_code=200,
+        content=result,
+        headers={"X-Idempotent-Replay": "true"} if replayed else {},
+    )
+
+
+def _confirm_reservation(
+    conn: sqlite3.Connection, reservation_id: str, formal_id: str, now: float
+) -> dict:
+    """事务内把有效预留转挂为正式消费（零增量），并迁移到 confirmed。"""
+    row = conn.execute(
+        "SELECT created_at FROM reservations "
+        "WHERE reservation_id = ? AND status = 'held'",
+        (reservation_id,),
+    ).fetchone()
+    if row is None:
+        # 行已由调用方确认存在；非 held 即 cancelled/expired（终态冲突）。
+        # 并发下若另一事务刚完成过期清扫，同样落到此——终态唯一。
+        status = conn.execute(
+            "SELECT status FROM reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()["status"]
+        raise _reservation_state_conflict(reservation_id, status)
+
+    created_at = row["created_at"]
+
+    # 正式消费 ID 冲突：若该 ID 已被其他消费固化（非同 ID 的本预留），拒绝
+    collision = conn.execute(
+        "SELECT 1 FROM requests WHERE request_id = ?", (formal_id,)
+    ).fetchone()
+    if collision is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"request_id '{formal_id}' 已被其他消费占用；"
+                "确认预留时请改用未占用的 request_id"
+            ),
+        )
+
+    # 占用事件转挂：reservation_id → request_id；金额/时刻/桶不变，
+    # 故不发生二次扣量（同一批事件只是换了归属标记，窗口求和不变）
+    cur = conn.execute(
+        "UPDATE usage_events SET request_id = ?, reservation_id = NULL "
+        "WHERE reservation_id = ?",
+        (formal_id, reservation_id),
+    )
+    events_count = cur.rowcount
+
+    # 固化正式消费判定（与 consume 同表同形；此后 releases/adjustments
+    # 即可按 request_id=formal_id 作用于这条消费）
+    items = _direct_items_for_request(conn, formal_id)
+    payload = {"request_id": formal_id, "buckets": items}
+    decision = {
+        "request_id": formal_id,
+        "allowed": True,
+        "granted": items,
+        "decided_at": created_at,
+    }
+    conn.execute(
+        "INSERT INTO requests "
+        "(request_id, payload_hash, payload, decision, allowed, created_at) "
+        "VALUES (?, ?, ?, ?, 1, ?)",
+        (
+            formal_id,
+            payload_hash(items),
+            json.dumps(payload, sort_keys=True),
+            json.dumps(decision),
+            created_at,
+        ),
+    )
+
+    # held → confirmed：条件更新保证终态唯一
+    upd = conn.execute(
+        "UPDATE reservations SET status = 'confirmed', request_id = ?, "
+        "finalized_at = ? WHERE reservation_id = ? AND status = 'held'",
+        (formal_id, now, reservation_id),
+    )
+    if upd.rowcount != 1:  # pragma: no cover - 串行化下理论不可达
+        raise HTTPException(
+            status_code=409,
+            detail=f"预留 '{reservation_id}' 状态已变更，确认失败",
+        )
+
+    result = {
+        "reservation_id": reservation_id,
+        "request_id": formal_id,
+        "confirmed": True,
+        "buckets": items,
+        "events_consumed": events_count,
+        "confirmed_at": now,
+    }
+    conn.execute(
+        "UPDATE reservations SET terminal_result = ? WHERE reservation_id = ?",
+        (json.dumps(result), reservation_id),
+    )
+    # 首次成功确认在同一事务追加审计（不再追加 consume 审计：容量在创建
+    # 预留时已计入，确认只转移归属，不产生新的扣量事件）
+    audit.append_event(
+        conn,
+        op=audit.OP_RESERVE,
+        business_id=reservation_id,
+        result=audit.RESULT_CONFIRMED,
+        occurred_at=now,
+    )
+    return result
+
+
+@app.post("/v1/quota/reservations/{reservation_id}/cancel")
+def cancel_reservation(reservation_id: str):
+    """取消有效预留：释放整条贡献链。
+
+    在单个 ``BEGIN IMMEDIATE`` 事务内：先惰性释放到期预留，再删除目标
+    预留持有的全部贡献链事件（直接桶 + 全部祖先）、置预留为 cancelled，
+    并在同一事务追加一条 reserve/cancelled 审计；不会出现部分层已释放。
+
+    - 200：取消成功（或同 reservation_id 重放，原样返回并带
+      X-Idempotent-Replay: true，不重复释放）；
+    - 404：预留不存在；
+    - 409：预留已确认（已转为正式消费，请改用 releases 释放）或已取消/
+      已过期（终态唯一；并发竞争落败方同样返回 409）。
+    """
+    now = time.time()
+
+    # 到期预留先在独立事务惰性过期，取消只对仍有效的 held 预留生效
+    _expire_due_reservations(now)
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT status, terminal_result FROM reservations "
+                "WHERE reservation_id = ?",
+                (reservation_id,),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"预留 '{reservation_id}' 不存在，无法取消",
+                )
+
+            if row["status"] == RESERVATION_CANCELLED:
+                # 幂等重放：原样返回首次取消结果
+                result = json.loads(row["terminal_result"])
+                replayed = True
+                conn.execute("COMMIT")
+            else:
+                result = _cancel_reservation(conn, reservation_id, now)
+                conn.execute("COMMIT")
+                replayed = False
+        except Exception:
+            _rollback_quietly(conn)
+            raise
+    finally:
+        conn.close()
+
+    return JSONResponse(
+        status_code=200,
+        content=result,
+        headers={"X-Idempotent-Replay": "true"} if replayed else {},
+    )
+
+
+def _cancel_reservation(
+    conn: sqlite3.Connection, reservation_id: str, now: float
+) -> dict:
+    """事务内释放预留整条贡献链并迁移到 cancelled。"""
+    row = conn.execute(
+        "SELECT status FROM reservations WHERE reservation_id = ?",
+        (reservation_id,),
+    ).fetchone()
+    # 行存在性由调用方保证；confirmed/expired 等终态均不可取消
+    if row["status"] != RESERVATION_HELD:
+        raise _reservation_state_conflict(reservation_id, row["status"])
+
+    # 先取直接点名桶用于响应，再整条删除（直接 + 祖先汇总）
+    direct_rows = conn.execute(
+        "SELECT bucket_key, amount FROM usage_events "
+        "WHERE reservation_id = ? AND direct = 1",
+        (reservation_id,),
+    ).fetchall()
+    buckets = merge_items(
+        [{"key": r["bucket_key"], "amount": r["amount"]} for r in direct_rows]
+    )
+    deleted = conn.execute(
+        "DELETE FROM usage_events WHERE reservation_id = ?",
+        (reservation_id,),
+    ).rowcount
+
+    upd = conn.execute(
+        "UPDATE reservations SET status = 'cancelled', finalized_at = ? "
+        "WHERE reservation_id = ? AND status = 'held'",
+        (now, reservation_id),
+    )
+    if upd.rowcount != 1:  # pragma: no cover - 串行化下理论不可达
+        raise HTTPException(
+            status_code=409,
+            detail=f"预留 '{reservation_id}' 状态已变更，取消失败",
+        )
+
+    result = {
+        "reservation_id": reservation_id,
+        "cancelled": True,
+        "released_buckets": buckets,
+        "events_reverted": deleted,
+        "cancelled_at": now,
+    }
+    conn.execute(
+        "UPDATE reservations SET terminal_result = ? WHERE reservation_id = ?",
+        (json.dumps(result), reservation_id),
+    )
+    audit.append_event(
+        conn,
+        op=audit.OP_RESERVE,
+        business_id=reservation_id,
+        result=audit.RESULT_CANCELLED,
+        occurred_at=now,
+    )
+    return result
+
+
+@app.get("/v1/quota/reservations/{reservation_id}")
+def get_reservation(reservation_id: str):
+    """查询预留当前状态；若已到期则先惰性过期（独立写事务）再返回。
+
+    过期清扫在独立写事务内完成（释放整条贡献链并追加 reserve/expired
+    审计，独立提交），因此查询观察到的 held 一定仍有效、观察到的
+    expired 一定已释放容量。
+    """
+    now = time.time()
+    # 到期预留先在独立写事务惰性过期并留痕，随后只读返回最新状态
+    _expire_due_reservations(now)
+
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT reservation_id, status, payload, request_id, "
+            "expires_in, expires_at, created_at, finalized_at "
+            "FROM reservations WHERE reservation_id = ?",
+            (reservation_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail=f"预留 '{reservation_id}' 不存在"
+            )
+        result = _reservation_response(row)
+    finally:
+        conn.close()
+    return result
 
 
 # ---------------------------------------------------------------- 回放模拟

@@ -23,19 +23,26 @@ CREATE TABLE IF NOT EXISTS buckets (
     parent_key      TEXT REFERENCES buckets (key)
 );
 
--- 滚动窗口用量事件：每次放行按"贡献链"写入，窗口内求和即为当前用量。
--- direct=1：请求直接点名本桶的贡献；direct=0：后代桶消费沿父链向上
--- 汇总到本桶的贡献（同一请求对同一祖先至多一条汇总，不重复生成）。
+-- 滚动窗口用量事件：每次放行（含预留占用）按"贡献链"写入，窗口内求和即
+-- 为当前用量。
+-- direct=1：直接点名本桶的贡献；direct=0：后代桶消费沿父链向上
+-- 汇总到本桶的贡献（同一请求/预留对同一祖先至多一条汇总，不重复生成）。
+-- request_id 非空 = 已固化的正式消费（含已确认预留转正式）；
+-- reservation_id 非空 = 预留持有中的容量占用（确认时转挂 request_id 并
+-- 清空本列；取消/过期时整行删除），二者互斥。
 CREATE TABLE IF NOT EXISTS usage_events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    bucket_key  TEXT    NOT NULL REFERENCES buckets (key),
-    request_id  TEXT    NOT NULL,
-    amount      INTEGER NOT NULL CHECK (amount > 0),
-    created_at  REAL    NOT NULL,
-    direct      INTEGER NOT NULL DEFAULT 1 CHECK (direct IN (0, 1))
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    bucket_key      TEXT    NOT NULL REFERENCES buckets (key),
+    request_id      TEXT,
+    reservation_id  TEXT,
+    amount          INTEGER NOT NULL CHECK (amount > 0),
+    created_at      REAL    NOT NULL,
+    direct          INTEGER NOT NULL DEFAULT 1 CHECK (direct IN (0, 1))
 );
 CREATE INDEX IF NOT EXISTS idx_usage_events_bucket_ts
     ON usage_events (bucket_key, created_at);
+-- reservation_id 列由迁移补齐旧库；其索引在迁移完成后再创建
+-- （见 _apply_migrations），避免在缺列的旧表上直接建索引失败
 
 -- 幂等表：request_id 首次出现时固化载荷哈希与判定结果
 -- release_id 非空表示该消费已被对应释放单成功释放
@@ -69,6 +76,32 @@ CREATE TABLE IF NOT EXISTS adjustments (
     created_at    REAL    NOT NULL
 );
 
+-- 预留幂等/生命周期表：reservation_id 首次成功创建时固化完整载荷
+-- （桶列表 + expires_in）与创建结果。状态机：
+--   held（持有容量）→ confirmed（转为正式消费）/ cancelled（取消释放）
+--                    / expired（惰性过期释放，后续操作内清扫）
+-- 终态（confirmed/cancelled/expired）不可再迁移；创建重放原样返回。
+-- request_id 为确认后转成的正式消费业务 ID（默认取 reservation_id），
+-- 仅 confirmed 行非空，供 releases/adjustments 操作。
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_id TEXT PRIMARY KEY,
+    payload_hash   TEXT    NOT NULL,
+    payload        TEXT    NOT NULL,
+    status         TEXT    NOT NULL CHECK (
+                        status IN ('held', 'confirmed', 'cancelled', 'expired')
+                   ),
+    request_id     TEXT,
+    expires_in     REAL    NOT NULL,
+    expires_at     REAL    NOT NULL,
+    result         TEXT    NOT NULL,
+    created_at     REAL    NOT NULL,
+    finalized_at   REAL,
+    -- 终态操作（确认/取消/过期）首次成功时固化的响应，供幂等重放原样返回
+    terminal_result TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_held_expiry
+    ON reservations (status, expires_at);
+
 -- 哈希审计链：仅追加。seq 全局递增，首条 prev_hash 为 64 个 0，
 -- hash = SHA-256(prev_hash 的原始32字节 + canonical JSON 事件)
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -83,7 +116,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 """
 
-# 旧库增量迁移：为已存在的表补充新列（SQLite 无 ADD COLUMN IF NOT EXISTS）
+# 旧库增量迁移：为已存在的表补充新列（SQLite 无 ADD COLUMN IF NOT EXISTS）。
+# usage_events 需把 request_id 放宽为可空并新增 reservation_id：SQLite 无法
+# 直接改列约束，故检测到旧结构后在单事务内按 12 步表重建流程整体迁移。
 _MIGRATIONS = (
     (
         "requests",
@@ -94,11 +129,6 @@ _MIGRATIONS = (
         "buckets",
         "parent_key",
         "ALTER TABLE buckets ADD COLUMN parent_key TEXT REFERENCES buckets (key)",
-    ),
-    (
-        "usage_events",
-        "direct",
-        "ALTER TABLE usage_events ADD COLUMN direct INTEGER NOT NULL DEFAULT 1",
     ),
 )
 
@@ -130,6 +160,87 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if column not in cols:
             conn.execute(ddl)
+    _migrate_usage_events(conn)
+
+
+def _migrate_usage_events(conn: sqlite3.Connection) -> None:
+    """旧库 usage_events 迁移：request_id 放宽为可空并新增 reservation_id。
+
+    新列可由 ADD COLUMN 直接补入，但 ``request_id NOT NULL`` 约束无法就地
+    修改；预留持有中的事件 request_id 须为 NULL，故检测到旧约束后按 SQLite
+    推荐的表重建流程原子替换（外键临时关闭、单事务提交）。
+    """
+    cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(usage_events)")}
+    if not cols:
+        return
+    request_notnull = (
+        bool(cols["request_id"]["notnull"]) if "request_id" in cols else False
+    )
+    # 旧结构：request_id 为 NOT NULL（无法就地放宽）或缺 direct 列——
+    # 统一走表重建归一化到最新结构
+    need_rebuild = request_notnull or "direct" not in cols
+    if "reservation_id" not in cols and not need_rebuild:
+        conn.execute(
+            "ALTER TABLE usage_events ADD COLUMN reservation_id TEXT"
+        )
+    if not need_rebuild:
+        # 新列已补且 request_id 本就可空（或刚由 SCHEMA 建成新表）
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_events_reservation "
+            "ON usage_events (reservation_id)"
+        )
+        return
+
+    # 极旧库可能同时缺 direct 列：拷贝时以默认值 1（直接消费）补齐
+    has_direct = "direct" in cols
+    direct_select = "direct" if has_direct else "1 AS direct"
+
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            """
+            CREATE TABLE usage_events_new (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                bucket_key      TEXT    NOT NULL REFERENCES buckets (key),
+                request_id      TEXT,
+                reservation_id  TEXT,
+                amount          INTEGER NOT NULL CHECK (amount > 0),
+                created_at      REAL    NOT NULL,
+                direct          INTEGER NOT NULL DEFAULT 1 CHECK (direct IN (0, 1))
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            INSERT INTO usage_events_new
+                (id, bucket_key, request_id, reservation_id, amount,
+                 created_at, direct)
+            SELECT id, bucket_key, request_id, NULL, amount, created_at,
+                   {direct_select}
+              FROM usage_events
+            """
+        )
+        conn.execute("DROP TABLE usage_events")
+        conn.execute("ALTER TABLE usage_events_new RENAME TO usage_events")
+        conn.execute(
+            "CREATE INDEX idx_usage_events_bucket_ts "
+            "ON usage_events (bucket_key, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX idx_usage_events_reservation "
+            "ON usage_events (reservation_id)"
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        _rollback_quietly(conn)
+        raise
+    finally:
+        # 重新开启外键（连接默认即 ON；PRAGMA 无事务生效）
+        conn.execute("PRAGMA foreign_keys=ON")
+        # 迁移后立即核对外键完整性（rebuild 期间外键被临时关闭）
+        if conn.execute("PRAGMA foreign_key_check").fetchall():  # pragma: no cover
+            raise sqlite3.IntegrityError("usage_events 迁移后外键校验失败")
 
 
 def seed_buckets(config_path: str, db_path: str | None = None) -> list[str]:

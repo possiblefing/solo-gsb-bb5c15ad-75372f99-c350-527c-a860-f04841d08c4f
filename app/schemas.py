@@ -25,6 +25,21 @@ class AdjustmentRequest(BaseModel):
     buckets: list[BucketItem] = Field(min_length=1, max_length=100)
 
 
+class ReservationRequest(BaseModel):
+    """创建预留：提交桶列表与 expires_in（秒），立即占用整条贡献链容量。"""
+
+    reservation_id: str = Field(min_length=1, max_length=128)
+    buckets: list[BucketItem] = Field(min_length=1, max_length=100)
+    expires_in: float = Field(gt=0, le=365 * 24 * 3600)
+
+
+class ReservationConfirmRequest(BaseModel):
+    """确认预留（可选载荷）：携带 request_id 时固化为该正式消费 ID。"""
+
+    # 省略/None：正式消费 ID 默认取 reservation_id
+    request_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
 class BucketConfig(BaseModel):
     limit: int = Field(gt=0, le=2**31 - 1)
     window_seconds: float = Field(gt=0, le=365 * 24 * 3600)
